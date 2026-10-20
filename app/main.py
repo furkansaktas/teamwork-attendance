@@ -1,10 +1,11 @@
 from datetime import date, datetime, timedelta, timezone
 from math import asin, cos, radians, sin, sqrt
+from typing import NoReturn
 
 import jwt
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -21,6 +22,7 @@ from .models import (
     Notification,
     SessionStatus,
     User,
+    as_utc,
 )
 from .schemas import (
     AttendanceConfirmRequest,
@@ -31,7 +33,9 @@ from .schemas import (
     AbsenceRequestResponse,
     AbsenceReview,
     ClassStatsResponse,
+    CodeRotationResponse,
     EnrollmentCreate,
+    QrTokenResponse,
     SectionCreate,
     SectionResponse,
     StudentStatsResponse,
@@ -47,9 +51,13 @@ from .security import (
     digest_code,
     hash_password,
     make_code,
+    make_qr_token,
     require_role,
     verify_password,
 )
+
+# Attempts with these results count toward the rate limits.
+FAILED_RESULTS = ("invalid", "not_enrolled")
 
 app = FastAPI(
     title="Attendance API",
@@ -66,6 +74,77 @@ def distance_meters(latitude_a: float, longitude_a: float, latitude_b: float, lo
     lon_delta = radians(longitude_b - longitude_a)
     value = sin(lat_delta / 2) ** 2 + cos(radians(latitude_a)) * cos(radians(latitude_b)) * sin(lon_delta / 2) ** 2
     return earth_radius * 2 * asin(sqrt(value))
+
+
+def client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def ensure_open(session: AttendanceSession) -> None:
+    if session.status != SessionStatus.OPEN:
+        raise HTTPException(status_code=409, detail="Attendance session is not open")
+    if datetime.now(timezone.utc) >= as_utc(session.expires_at):
+        raise HTTPException(status_code=410, detail="Attendance session has expired")
+
+
+def attempt_limit_reached(db: Session, session: AttendanceSession, student_id: str, ip: str, device_id: str | None) -> bool:
+    """True when failed attempts for this student, IP, or device exceed the window limit in this session."""
+    settings = get_settings()
+    window_start = datetime.now(timezone.utc) - timedelta(minutes=settings.attempt_window_minutes)
+    scopes = [
+        (CodeAttempt.student_id == student_id, settings.attempt_limit_per_student),
+        (CodeAttempt.ip_address == ip, settings.attempt_limit_per_ip),
+    ]
+    if device_id:
+        scopes.append((CodeAttempt.device_id == device_id, settings.attempt_limit_per_device))
+    for condition, limit in scopes:
+        failures = db.scalar(
+            select(func.count(CodeAttempt.id)).where(
+                CodeAttempt.attendance_session_id == session.id,
+                CodeAttempt.attempted_at >= window_start,
+                CodeAttempt.result.in_(FAILED_RESULTS),
+                condition,
+            )
+        )
+        if failures >= limit:
+            return True
+    return False
+
+
+def reject_attempt(
+    db: Session,
+    session: AttendanceSession,
+    student_id: str,
+    result: str,
+    ip: str,
+    device_id: str | None,
+    status_code: int,
+    detail: str,
+) -> NoReturn:
+    """Log a rejected confirmation attempt, then return the error to the client."""
+    db.add(
+        CodeAttempt(
+            attendance_session_id=session.id,
+            student_id=student_id,
+            result=result,
+            ip_address=ip,
+            device_id=device_id,
+        )
+    )
+    db.commit()
+    raise HTTPException(status_code=status_code, detail=detail)
+
+
+def qr_nonce_for(token: str, session: AttendanceSession) -> str | None:
+    """Return the token's one-time nonce if it is a valid, unexpired QR token for the current code version."""
+    try:
+        claims = jwt.decode(token, get_settings().code_secret, algorithms=["HS256"])
+    except jwt.InvalidTokenError:
+        return None
+    if claims.get("session_id") != session.id or claims.get("code_version") != session.code_version:
+        return None
+    nonce = claims.get("nonce")
+    return nonce if isinstance(nonce, str) and nonce else None
 
 
 @app.on_event("startup")
@@ -172,11 +251,7 @@ def open_attendance(
     db.add(session)
     db.commit()
     db.refresh(session)
-    qr_token = jwt.encode(
-        {"session_id": session.id, "code_version": session.code_version, "exp": expires_at},
-        get_settings().code_secret,
-        algorithm="HS256",
-    )
+    qr_token, _ = make_qr_token(session.id, session.code_version, expires_at)
     return AttendanceSessionResponse(
         id=session.id,
         section_id=session.section_id,
@@ -187,20 +262,79 @@ def open_attendance(
     )
 
 
+@app.post(
+    "/api/v1/attendance-sessions/{session_id}/qr-token",
+    response_model=QrTokenResponse,
+    tags=["professor"],
+)
+def refresh_qr_token(
+    session_id: str,
+    professor: User = Depends(require_role("professor")),
+    db: Session = Depends(get_db),
+) -> QrTokenResponse:
+    """Issue a fresh single-use QR token. Call again to refresh the QR shown on screen."""
+    session = db.get(AttendanceSession, session_id)
+    if session is None or session.opened_by != professor.id:
+        raise HTTPException(status_code=404, detail="Attendance session not found")
+    ensure_open(session)
+    qr_token, expires_at = make_qr_token(session.id, session.code_version, as_utc(session.expires_at))
+    return QrTokenResponse(qr_token=qr_token, expires_at=expires_at)
+
+
+@app.post(
+    "/api/v1/attendance-sessions/{session_id}/rotate-code",
+    response_model=CodeRotationResponse,
+    tags=["professor"],
+)
+def rotate_code(
+    session_id: str,
+    professor: User = Depends(require_role("professor")),
+    db: Session = Depends(get_db),
+) -> CodeRotationResponse:
+    """Replace the session code. The old code and any QR tokens issued before this call stop working."""
+    session = db.get(AttendanceSession, session_id)
+    if session is None or session.opened_by != professor.id:
+        raise HTTPException(status_code=404, detail="Attendance session not found")
+    ensure_open(session)
+    code = make_code()
+    session.code_hash = digest_code(code)
+    session.code_version += 1
+    qr_token, expires_at = make_qr_token(session.id, session.code_version, as_utc(session.expires_at))
+    db.add(
+        AuditLog(actor_id=professor.id, action="attendance_code_rotated", entity_type="attendance_session", entity_id=session.id)
+    )
+    db.commit()
+    db.refresh(session)
+    return CodeRotationResponse(
+        code=code,
+        code_version=session.code_version,
+        qr_token=qr_token,
+        expires_at=expires_at,
+    )
+
+
 @app.post("/api/v1/attendance-sessions/{session_id}/confirm", response_model=AttendanceResponse, tags=["student"])
 def confirm_attendance(
     session_id: str,
     payload: AttendanceConfirmRequest,
+    request: Request,
     student: User = Depends(require_role("student")),
     db: Session = Depends(get_db),
+    device_id: str | None = Header(default=None, alias="X-Device-Id", max_length=128),
 ) -> AttendanceResponse:
     if not payload.code and not payload.qr_token:
         raise HTTPException(status_code=422, detail="Provide code or qr_token")
     session = db.get(AttendanceSession, session_id)
     if session is None or session.status != SessionStatus.OPEN:
         raise HTTPException(status_code=404, detail="Attendance session is not open")
-    if datetime.now(timezone.utc) >= session.expires_at:
+    if datetime.now(timezone.utc) >= as_utc(session.expires_at):
         raise HTTPException(status_code=410, detail="Attendance session has expired")
+    ip = client_ip(request)
+    if attempt_limit_reached(db, session, student.id, ip, device_id):
+        reject_attempt(
+            db, session, student.id, "rate_limited", ip, device_id,
+            429, "Too many failed attempts. Try again later.",
+        )
     enrollment = db.scalar(
         select(Enrollment).where(
             Enrollment.section_id == session.section_id,
@@ -209,24 +343,15 @@ def confirm_attendance(
         )
     )
     if enrollment is None:
-        db.add(CodeAttempt(attendance_session_id=session.id, student_id=student.id, result="not_enrolled"))
-        db.commit()
-        raise HTTPException(status_code=403, detail="Student is not enrolled")
-    method = "code"
-    valid = bool(payload.code and code_matches(payload.code, session.code_hash))
-    if payload.qr_token:
-        method = "qr"
-        try:
-            qr = jwt.decode(payload.qr_token, get_settings().code_secret, algorithms=["HS256"])
-            valid = valid or (
-                qr.get("session_id") == session.id and qr.get("code_version") == session.code_version
-            )
-        except jwt.InvalidTokenError:
-            valid = False
-    if not valid:
-        db.add(CodeAttempt(attendance_session_id=session.id, student_id=student.id, result="invalid"))
-        db.commit()
-        raise HTTPException(status_code=400, detail="Invalid attendance code or QR")
+        reject_attempt(db, session, student.id, "not_enrolled", ip, device_id, 403, "Student is not enrolled")
+    code_ok = bool(payload.code and code_matches(payload.code, session.code_hash))
+    qr_nonce = qr_nonce_for(payload.qr_token, session) if payload.qr_token else None
+    if not code_ok and qr_nonce is None:
+        reject_attempt(db, session, student.id, "invalid", ip, device_id, 400, "Invalid attendance code or QR")
+    # A valid QR is single-use: its nonce may appear on one record only.
+    method = "qr" if qr_nonce else "code"
+    if qr_nonce and db.scalar(select(AttendanceRecord.id).where(AttendanceRecord.qr_nonce == qr_nonce)):
+        reject_attempt(db, session, student.id, "invalid", ip, device_id, 409, "QR code has already been used")
     location_required = session.location_latitude is not None
     if location_required and (payload.latitude is None or payload.longitude is None):
         raise HTTPException(status_code=422, detail="Location is required for this attendance session")
@@ -237,15 +362,38 @@ def confirm_attendance(
         payload.longitude,
     ) > session.allowed_radius_meters:
         raise HTTPException(status_code=403, detail="You are outside the attendance location")
+    # One device may confirm attendance for only one student per session.
+    if device_id and db.scalar(
+        select(AttendanceRecord.id).where(
+            AttendanceRecord.attendance_session_id == session.id,
+            AttendanceRecord.device_id == device_id,
+            AttendanceRecord.student_id != student.id,
+        )
+    ):
+        reject_attempt(
+            db, session, student.id, "device_conflict", ip, device_id,
+            409, "This device already confirmed attendance for another student",
+        )
     record = AttendanceRecord(
         attendance_session_id=session.id,
         student_id=student.id,
         confirmation_method=method,
         latitude=payload.latitude,
         longitude=payload.longitude,
+        qr_nonce=qr_nonce,
+        ip_address=ip,
+        device_id=device_id,
     )
     db.add(record)
-    db.add(CodeAttempt(attendance_session_id=session.id, student_id=student.id, result="accepted"))
+    db.add(
+        CodeAttempt(
+            attendance_session_id=session.id,
+            student_id=student.id,
+            result="accepted",
+            ip_address=ip,
+            device_id=device_id,
+        )
+    )
     db.add(AuditLog(actor_id=student.id, action="attendance_confirmed", entity_type="attendance_session", entity_id=session.id))
     try:
         db.commit()

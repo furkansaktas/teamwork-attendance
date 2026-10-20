@@ -35,6 +35,13 @@ def ensure_additive_schema() -> None:
         "attendance_records": {
             "latitude": "FLOAT",
             "longitude": "FLOAT",
+            "qr_nonce": "VARCHAR(64)",
+            "ip_address": "VARCHAR(45)",
+            "device_id": "VARCHAR(128)",
+        },
+        "attendance_code_attempts": {
+            "ip_address": "VARCHAR(45)",
+            "device_id": "VARCHAR(128)",
         },
     }
     inspector = inspect(engine)
@@ -44,3 +51,7 @@ def ensure_additive_schema() -> None:
             for column, sql_type in columns.items():
                 if column not in existing:
                     connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}"))
+        # create_all only builds indexes for new tables, so add the QR-nonce uniqueness here too.
+        connection.execute(
+            text("CREATE UNIQUE INDEX IF NOT EXISTS ux_attendance_records_qr_nonce ON attendance_records (qr_nonce)")
+        )

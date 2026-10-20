@@ -52,6 +52,16 @@ class AttendanceSessionResponse(BaseModel):
     location_required: bool
 
 
+class QrTokenResponse(BaseModel):
+    qr_token: str
+    expires_at: datetime
+
+
+class CodeRotationResponse(QrTokenResponse):
+    code: str
+    code_version: int
+
+
 class AttendanceConfirmRequest(BaseModel):
     code: str | None = Field(default=None, min_length=6, max_length=64)
     qr_token: str | None = None

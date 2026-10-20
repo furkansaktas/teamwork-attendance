@@ -2,7 +2,7 @@ from datetime import date, datetime, timezone
 from enum import StrEnum
 from uuid import uuid4
 
-from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
@@ -10,6 +10,11 @@ from .db import Base
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def as_utc(value: datetime) -> datetime:
+    """SQLite returns naive datetimes; every stored value is UTC, so treat them as such."""
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
 class Role(StrEnum):
@@ -74,7 +79,10 @@ class AttendanceSession(Base):
 
 class AttendanceRecord(Base):
     __tablename__ = "attendance_records"
-    __table_args__ = (UniqueConstraint("attendance_session_id", "student_id"),)
+    __table_args__ = (
+        UniqueConstraint("attendance_session_id", "student_id"),
+        Index("ux_attendance_records_qr_nonce", "qr_nonce", unique=True),
+    )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     attendance_session_id: Mapped[str] = mapped_column(ForeignKey("attendance_sessions.id"), index=True)
     student_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
@@ -83,6 +91,9 @@ class AttendanceRecord(Base):
     confirmed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
     latitude: Mapped[float | None] = mapped_column(Float)
     longitude: Mapped[float | None] = mapped_column(Float)
+    qr_nonce: Mapped[str | None] = mapped_column(String(64))
+    ip_address: Mapped[str | None] = mapped_column(String(45))
+    device_id: Mapped[str | None] = mapped_column(String(128))
 
 
 class CodeAttempt(Base):
@@ -92,6 +103,8 @@ class CodeAttempt(Base):
     student_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
     result: Mapped[str] = mapped_column(String(30))
     attempted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    ip_address: Mapped[str | None] = mapped_column(String(45))
+    device_id: Mapped[str | None] = mapped_column(String(128))
 
 
 class AuditLog(Base):

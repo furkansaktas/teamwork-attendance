@@ -37,6 +37,20 @@ def code_matches(code: str, expected: str) -> bool:
     return compare_digest(digest_code(code), expected)
 
 
+def make_qr_token(session_id: str, code_version: int, session_expires_at: datetime) -> tuple[str, datetime]:
+    """Signed, short-lived, single-use QR token. Returns the token and its expiry."""
+    issued_at = datetime.now(timezone.utc)
+    expires = min(issued_at + timedelta(seconds=get_settings().qr_ttl_seconds), session_expires_at)
+    claims = {
+        "session_id": session_id,
+        "code_version": code_version,
+        "nonce": secrets.token_urlsafe(16),
+        "iat": issued_at,
+        "exp": expires,
+    }
+    return jwt.encode(claims, get_settings().code_secret, algorithm="HS256"), expires
+
+
 def create_token(user: User) -> str:
     expires = datetime.now(timezone.utc) + timedelta(minutes=get_settings().access_token_minutes)
     return jwt.encode({"sub": user.id, "role": user.role, "exp": expires}, get_settings().jwt_secret, algorithm="HS256")

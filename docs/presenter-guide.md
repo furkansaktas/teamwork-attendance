@@ -55,8 +55,8 @@ session. It is not single-use per student.
 - Lifetime is set by `duration_minutes`: default **15**, allowed range **1–120**.
 - The code stops working when `expires_at` passes (the API returns `410`), or when
   the professor cancels the session (`status = cancelled`).
-- The professor cannot regenerate or rotate the code. `code_version` exists in
-  the table and in the QR token, but nothing ever changes it from 1.
+- The professor can rotate the code with `POST /api/v1/attendance-sessions/{id}/rotate-code`.
+  This increments `code_version`, so the old code and any QR tokens issued earlier stop working.
 
 **Storage:** the plain code is returned once in the response to the professor.
 The database stores only `code_hash`, which is an **HMAC-SHA256** of the code
@@ -75,16 +75,24 @@ letters is rejected. The student UI should uppercase the input before sending it
 | Signed QR token | Implemented | JWT (HS256, `CODE_SECRET`) with `session_id`, `code_version`, and `exp` |
 | Optional location fence | Implemented, per session | Professor can set latitude, longitude, and radius (10–1000 m). The server computes the distance (haversine) and rejects students outside it (`403`) |
 | Attempt logging | Implemented | Every accepted, invalid, or not-enrolled attempt is written to `attendance_code_attempts` |
-| **Rate limiting** | **Not implemented** | Attempts are logged but never limited. The planning doc asks for limits per account, session, device, and IP |
-| **IP or device check** | **Not implemented** | No IP or device data is read or stored |
-| **One-time QR nonce** | **Not implemented** | A QR token can be reused by anyone until it expires |
-| **Code rotation** | **Not implemented** | See section 3 |
+| Rate limiting | Implemented | Failed attempts (`invalid`, `not_enrolled`) are counted per student, per client IP, and per device within a sliding window (default 10 min). Going over a limit returns `429` and logs a `rate_limited` attempt. Limits: 5 per student, 30 per IP, 30 per device |
+| IP and device check | Implemented | Each attempt stores the client IP and an optional `X-Device-Id` header. One device can confirm for only one student per session (`409` otherwise) |
+| One-time QR token | Implemented | Each QR token carries a random nonce and expires after 30 s (`QR_TTL_SECONDS`). The nonce is saved on the attendance record with a unique index, so a token works for one student only. The professor refreshes the QR with `POST .../qr-token` |
+| Code rotation | Implemented | `POST .../rotate-code` issues a new code and increments `code_version`. The old code and any QR tokens issued before the rotation stop working |
 
 **What to say:** the window is short, each student can count only once, and
-enrollment is required. The optional location fence is the main defence against
-someone sharing the code with students who are not in the room, and only if the
-professor turns it on. A student can still screenshot the code or QR code
-during the window.
+enrollment is required. A QR code now works for one student and expires within
+30 seconds, so a screenshot is useless once it has been used or has expired. Failed
+guesses are rate-limited, and one device cannot confirm for two students. Codes
+can be rotated during a session. The optional location fence is still the main
+defence against someone sharing the code with students who are not in the room,
+and only if the professor turns it on.
+
+**Limits of these controls:** the IP is the address the app sees directly. Behind a
+reverse proxy, every student would share the proxy's address, so the IP limit
+needs proxy headers configured before production. The device ID is a header the
+client sends, so a determined student can change it. These controls deter casual
+sharing and guessing. They do not stop a student who is willing to work around them.
 
 **Location caveat:** the distance check uses coordinates sent by the student's
 device. GPS can be spoofed, so the fence is a deterrent, not proof of presence.
@@ -131,6 +139,8 @@ endpoint enforces.
 | POST | `/sections/{section_id}/enrollments` | professor | Enroll a student (`student_id` in body) |
 | POST | `/attendance-sessions` | professor | Open attendance. Returns `code`, `qr_token`, `expires_at` |
 | POST | `/attendance-sessions/{session_id}/confirm` | student | Submit `code` or `qr_token` (plus location if required) |
+| POST | `/attendance-sessions/{session_id}/qr-token` | professor | Issue a fresh single-use QR token (valid 30 s). Call repeatedly to refresh the QR on screen |
+| POST | `/attendance-sessions/{session_id}/rotate-code` | professor | Replace the session code. Returns the new code and a QR token. Old codes and QR tokens stop working |
 | POST | `/attendance-sessions/{session_id}/cancel` | professor | Cancel an open session. Notifies enrolled students |
 | POST | `/absence-requests` | student | Submit an excused-absence request |
 | GET | `/sections/{section_id}/absence-requests` | professor | List requests for a section |
@@ -377,7 +387,9 @@ than being asked about them.
 4. **No attendee list.** Professors see counts per session, not who attended.
 5. **Statistics count cancelled and not-yet-confirmed sessions as absent.**
 6. **`late` is never set.** Every record is `present`.
-7. **No rate limiting, IP check, or device check.**
+7. **Rate limits and device checks depend on the deployment.** The IP limit
+   needs proxy headers configured behind a reverse proxy, and the device ID is
+   client-supplied.
 8. **Location relies on client-reported GPS.**
 9. **No 2FA, refresh tokens, or logout.**
 10. **No test suite is tracked in the repository,** although pytest is listed as a
